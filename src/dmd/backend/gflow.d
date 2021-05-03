@@ -187,7 +187,7 @@ private void rdgenkill()
             asgdefelems(b, b.Belem, go.defnod[], i);    // fill in go.defnod[]
     assert(i == 0);
 
-    initDNunambigVectors(go.defnod[]);
+    fillInDNunambig(go.defnod[]);
 
     foreach (b; dfo[])    // for each block
     {
@@ -291,34 +291,130 @@ private void asgdefelems(block *b,elem *n, DefNode[] defnod, ref size_t i)
     }
 }
 
-/*************************************
- * Allocate and initialize DNumambig vectors in go.defnod[]
+
+version = CheckAgainstOldMethod;
+/**************************************
+ * Fill in the DefNode.DNumambig vector.
+ * Set bits defnod[] indices for entries
+ * which are completely destroyed when e is
+ * unambiguously assigned to.
+ * Params:
+ *      e = defnod[] entry that is an assignment to a variable
  */
 
 @trusted
 extern (D)
-private void initDNunambigVectors(DefNode[] defnod)
+private void fillInDNunambig(DefNode[] defnod)
 {
-    //printf("initDNunambigVectors()\n");
+    //printf("fillInDNunambig()\n");
     const size_t numbits = defnod.length;
     const size_t dim = (numbits + (VECBITS - 1)) >> VECSHIFT;
+
+    static uint hash(Symbol* s)
+    {
+        static if (s.sizeof == 8) // splitmix64
+        {
+            ulong x = cast(ptrdiff_t)s;
+            ulong z = (x + 0x9e3779b97f4a7c15);
+            z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9;
+            z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
+            z = z ^ (z >> 31);
+            return cast(uint)(z - (z >> 32));
+        }
+        else // hash-prospertor triple32
+        {
+            ulong x = cast(ptrdiff_t)s;
+            x++;
+            x ^= x >> 17;
+            x *= 0xed5ad4bb;
+            x ^= x >> 11;
+            x *= 0xac4c1b51;
+            x ^= x >> 15;
+            x *= 0x31848bab;
+            x ^= x >> 14;
+            return x;
+        }
+    }
+    static uint fastrange(uint hash, uint N)
+    {
+        return (cast(ulong)hash * N ) >> 32;
+    }
+
+    Barray!uint htab;
+    htab.setLength(2 * defnod.length);  // max load factor = 0.5
+    htab[] = uint.max;
 
     size_t j = 0;
     foreach (const i; 0 .. defnod.length)
     {
         elem *e = defnod[i].DNelem;
-        if (OTassign(e.Eoper) && e.EV.E1.Eoper == OPvar)
+        if (!(OTassign(e.Eoper) && e.EV.E1.Eoper == OPvar))
+            continue;
+
+        vec_t v = &go.dnunambig[j] + 2;
+        assert(vec_dim(v) == 0);
+        vec_dim(v) = dim;
+        vec_numbits(v) = numbits;
+        j += dim + 2;
+
+        // of course it modifies itself
+        vec_setbit(cast(uint) i, v);
+
+        elem *t = e.EV.E1;
+        Symbol *d = t.EV.Vsym;
+
+        targ_size_t toff = t.EV.Voffset;
+        targ_size_t tsize = (e.Eoper == OPstreq) ? type_size(e.ET) : tysize(t.Ety);
+        targ_size_t ttop = toff + tsize;
+
+        uint k = fastrange(hash(d), cast(uint)htab.length);
+        for (; htab[k] != uint.max; k = (k+1)==htab.length?0:k+1)
         {
-            vec_t v = &go.dnunambig[j] + 2;
-            assert(vec_dim(v) == 0);
-            vec_dim(v) = dim;
-            vec_numbits(v) = numbits;
-            j += dim + 2;
-            fillInDNunambig(v, e, defnod[]);
-            defnod[i].DNunambig = v;
+            uint i2 = htab[k];
+            elem *tn = defnod[i2].DNelem;
+
+            // If def of same variable, kill that def
+            elem *tn1 = tn.EV.E1;
+            if (d != tn1.EV.Vsym)
+                continue;
+
+            targ_size_t tn1size = (tn.Eoper == OPstreq)
+                ? type_size(tn.ET) : tysize(tn1.Ety);
+
+            // If t completely overlaps tn1
+            if (toff <= tn1.EV.Voffset && tn1.EV.Voffset + tn1size <= ttop)
+            {
+                vec_setbit(cast(uint)i2, v);
+            }
+            // if tn1 completely overlaps t
+            if (tn1.EV.Voffset <= toff && ttop <= tn1.EV.Voffset + tn1size)
+            {
+                vec_setbit(cast(uint)i, defnod[i2].DNunambig);
+            }
         }
+        htab[k] = cast(uint)i;
+
+        defnod[i].DNunambig = v;
     }
+    htab.dtor();
     assert(j <= go.dnunambig.length);
+    version (CheckAgainstOldMethod)
+    {
+        // Test result against old version
+
+        vec_t v = vec_calloc(numbits);
+        foreach (const i; 0 .. defnod.length)
+        {
+            if (defnod[i].DNunambig)
+            {
+                elem *e = defnod[i].DNelem;
+                vec_clear(v);
+                fillInDNunambigOldMethod(v, e, defnod[]);
+                assert(vec_equal(defnod[i].DNunambig, v));
+            }
+        }
+        vec_free(v);
+    }
 }
 
 /**************************************
@@ -331,9 +427,11 @@ private void initDNunambigVectors(DefNode[] defnod)
  *      e = defnod[] entry that is an assignment to a variable
  */
 
+version (CheckAgainstOldMethod)
+{
 @trusted
 extern (D)
-private void fillInDNunambig(vec_t v, elem *e, DefNode[] defnod)
+private void fillInDNunambigOldMethod(vec_t v, elem *e, DefNode[] defnod)
 {
     assert(OTassign(e.Eoper));
     elem *t = e.EV.E1;
@@ -369,7 +467,7 @@ private void fillInDNunambig(vec_t v, elem *e, DefNode[] defnod)
         }
     }
 }
-
+}
 
 /*************************************
  * Allocate and compute rd GEN and KILL.
